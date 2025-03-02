@@ -119,18 +119,37 @@ class EsriDumper:
         response = self._request("GET", self._build_url("/query"), params=query_args, headers=self._headers)
         oid_data = self._handle_esri_errors(response, "Could not retrieve object IDs")
         return sorted(map(int, oid_data.get("objectIds", [])))
-
+    
     def __iter__(self):
+        """Iterates through all features in the ESRI layer efficiently."""
+        query_fields = self._fields
         metadata = self.get_metadata()
         page_size = min(self._max_page_size, metadata.get("maxRecordCount", 500))
-
-        row_count = self.get_feature_count()
+        row_count = None
+    
+        try:
+            row_count = self.get_feature_count()
+        except EsriDownloadError:
+            self._logger.info("Source does not support feature count.")
+    
+        # If there are no records matching the query, return an empty generator
         if row_count == 0:
             return
-
+            yield
+    
         page_args = []
-
-        if metadata.get("supportsPagination"):
+    
+        if not self._paginate_oid and row_count is not None and (
+            metadata.get("supportsPagination") or 
+            metadata.get("advancedQueryCapabilities", {}).get("supportsPagination")
+        ):
+            # If the layer supports pagination, use resultOffset/resultRecordCount
+            if query_fields and not self.can_handle_pagination(query_fields):
+                self._logger.info(
+                    "Source does not support pagination with fields specified, using all fields."
+                )
+                query_fields = None
+    
             for offset in range(self._startWith, row_count, page_size):
                 query_args = self._build_query_args({
                     "resultOffset": offset,
@@ -139,33 +158,114 @@ class EsriDumper:
                     "geometryPrecision": self._precision,
                     "returnGeometry": self._request_geometry,
                     "outSR": self._outSR,
-                    "outFields": ",".join(self._fields or ["*"]),
+                    "outFields": ",".join(query_fields or ["*"]),
                     "f": "json",
                 })
                 page_args.append(query_args)
-
+    
+            self._logger.info("Built %s requests using pagination", len(page_args))
+        
         else:
-            oid_field_name = metadata.get("objectIdField")
+            # If pagination isn't available, use WHERE clause with OIDs
+            use_oids = True
+            oid_field_name = self._find_oid_field_name(metadata)
+    
             if not oid_field_name:
-                raise EsriDownloadError("Could not find ObjectID field")
-
-            oids = self._get_layer_oids()
-            for i in range(0, len(oids), page_size):
-                query_args = self._build_query_args({
-                    "where": f"{oid_field_name} >= {oids[i]} AND {oid_field_name} <= {oids[min(i+page_size, len(oids)-1)]}",
-                    "geometryPrecision": self._precision,
-                    "returnGeometry": self._request_geometry,
-                    "outSR": self._outSR,
-                    "outFields": ",".join(self._fields or ["*"]),
-                    "f": "json",
-                })
-                page_args.append(query_args)
-
+                raise EsriDownloadError("Could not find Object ID field.")
+    
+            if metadata.get("supportsStatistics"):
+                try:
+                    (oid_min, oid_max) = self._get_layer_min_max(oid_field_name)
+    
+                    for page_min in range(oid_min - 1, oid_max, page_size):
+                        page_max = min(page_min + page_size, oid_max)
+                        query_args = self._build_query_args({
+                            "where": f"{oid_field_name} > {page_min} AND {oid_field_name} <= {page_max}",
+                            "geometryPrecision": self._precision,
+                            "returnGeometry": self._request_geometry,
+                            "outSR": self._outSR,
+                            "outFields": ",".join(query_fields or ["*"]),
+                            "f": "json",
+                        })
+                        page_args.append(query_args)
+    
+                    self._logger.info("Built %s requests using OID WHERE clause", len(page_args))
+                    use_oids = False
+    
+                except EsriDownloadError:
+                    self._logger.warning("Failed to retrieve min/max OID. Trying OID enumeration.")
+    
+            if use_oids:
+                try:
+                    oids = sorted(map(int, self._get_layer_oids()))
+    
+                    for i in range(0, len(oids), page_size):
+                        page_min = oids[i]
+                        page_max = oids[min(i + page_size, len(oids) - 1)]
+                        query_args = self._build_query_args({
+                            "where": f"{oid_field_name} >= {page_min} AND {oid_field_name} <= {page_max}",
+                            "geometryPrecision": self._precision,
+                            "returnGeometry": self._request_geometry,
+                            "outSR": self._outSR,
+                            "outFields": ",".join(query_fields or ["*"]),
+                            "f": "json",
+                        })
+                        page_args.append(query_args)
+    
+                    self._logger.info("Built %s requests using OID enumeration", len(page_args))
+    
+                except EsriDownloadError:
+                    self._logger.warning("Falling back to spatial queries.")
+                    bounds = metadata["extent"]
+                    saved = set()
+    
+                    for feature in self._scrape_an_envelope(bounds, self._outSR, page_size):
+                        attrs = feature["attributes"]
+                        oid = attrs.get(oid_field_name)
+                        if oid in saved:
+                            continue
+                        yield esri2geojson(feature)
+                        saved.add(oid)
+    
+                    return
+    
+        # Process each query batch
         query_url = self._build_url("/query")
-        for query_args in page_args:
-            response = self._request("POST", query_url, headers=self._headers, data=query_args)
-            data = self._handle_esri_errors(response, "Could not retrieve features")
-
-            for feature in data.get("features", []):
-                yield esri2geojson(feature) if self._output_format == "geojson" else feature
+        headers = self._build_headers()
+    
+        for query_index, query_args in enumerate(page_args, start=1):
+            download_exception = None
+            data = None
+    
+            for retry in range(self._num_of_retry):
+                try:
+                    if query_index % self._requests_to_pause == 0:
+                        time.sleep(self._pause_seconds)
+                        self._logger.info("Pausing for %s seconds...", self._pause_seconds)
+    
+                    response = self._request("POST", query_url, headers=headers, data=query_args)
+                    data = self._handle_esri_errors(response, "Error retrieving features")
+                    download_exception = None
+                    break  # Exit retry loop if successful
+    
+                except (socket.timeout, ValueError, requests.exceptions.RequestException) as e:
+                    download_exception = EsriDownloadError(f"Error retrieving features: {e}")
+                    time.sleep(self._pause_seconds * (retry + 1))
+                    self._logger.warning("Retrying request... attempt %s", retry + 1)
+    
+            if download_exception:
+                raise download_exception
+    
+            error = data.get("error")
+            if error:
+                raise EsriDownloadError(f"ESRI API error: {error['message']}")
+    
+            features = data.get("features", [])
+    
+            for feature in features:
+                if self._output_format == "geojson":
+                    yield esri2geojson(feature)
+                else:
+                    yield feature
+    
 
